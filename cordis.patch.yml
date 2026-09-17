@@ -1,0 +1,6 @@
+# dsh-autocompact layer: mount the universal auto-compaction guard at profile
+# root. The plugin patches the host-plane llm seam (classification + true-window
+# overrides) and injects the official compaction group into presets missing it.
+- insert:
+    - id: dsh-autocompact
+      name: 'dsh-autocompact'
