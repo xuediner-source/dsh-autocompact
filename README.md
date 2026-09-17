@@ -27,6 +27,15 @@ DeepSeek Harness 通用上下文自动压缩守护插件：对**所有模型、�
 
 ## 安装
 
+从 GitHub（推荐）：
+
+```sh
+dsh plugin --profile desktop add github:xuediner-source/dsh-autocompact
+# 重启 DSH Desktop 后生效
+```
+
+或从本地目录：
+
 ```sh
 dsh plugin --profile desktop add F:/DPH/dsh-autocompact
 # 重启 DSH Desktop 后生效
