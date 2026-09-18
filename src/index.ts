@@ -1,18 +1,18 @@
 /**
  * dsh-autocompact — universal auto context compaction for DeepSeek Harness.
  *
- * Evidence-driven design (forensics on session-e456a8e9, 2026-09-17):
- *  - The session died with 0 compaction events while surface tokens grew to
- *    1,089,509; the final request failed upstream with code 11115
- *    ("prompt is too long: 100001 tokens > 100000 maximum") yet the harness
- *    retried 116 times as generic SERVER errors — the session went
- *    unresponsive. Two independent defects:
- *      (a) the active preset (minimal-grayscale) mounts NO compaction group;
+ * Evidence-driven design (forensics on one long session, 2026-09):
+ *  - The session died with 0 compaction events while surface tokens grew past
+ *    1M; the final request failed upstream with a context-limit error
+ *    ("prompt is too long: N tokens > M maximum") yet the harness retried it
+ *    100+ times as generic SERVER errors — the session went unresponsive. Two
+ *    independent defects:
+ *      (a) the active preset mounted NO compaction group;
  *      (b) providers mislabel context overflow, so the official recovery
  *          listener (failure.code === CONTEXT_WINDOW_EXCEEDED) never fires,
- *          and declared contextWindows are inflated (hy4-preview declared 1M
- *          against a real 100K upstream cap), so pressure thresholds computed
- *          against the wrong capacity.
+ *          and declared contextWindows are inflated (one third-party route
+ *          declared 1M against a real 100K upstream cap), so pressure
+ *          thresholds compute against the wrong capacity.
  *
  * This plugin is model-agnostic and preset-agnostic. Three layers:
  *  1. LLM seam classification (host plane, patched once): every ctx.llm.stream
@@ -27,7 +27,7 @@
  *  3. Engine mount: preset agent.cordis.yml files missing the official
  *     compaction group (compaction-basic + command-compact +
  *     tool-result-pruner) get it appended (with a .bak-autocompact backup),
- *     copying the exact block the official liangshen/novel-solo presets use.
+ *     copying the same block compaction-enabled presets use.
  *
  * Verification: `/autocompact status` reports the window table, classification
  * counters, injection results and engine availability.
@@ -101,14 +101,13 @@ interface AutocompactState {
   injected: string[];
 }
 
-/** Seeded from measured evidence, not vendor marketing. */
-const SEED_WINDOWS: Record<string, WindowEntry> = {
-  'xuedinerAPI/hy4-preview': {
-    contextWindow: 100_000,
-    source: 'seed: upstream code 11115 "100001 tokens > 100000 maximum" (session-e456a8e9, 2026-09-17)',
-    updatedAt: 0,
-  },
-};
+/**
+ * Built-in seeds are intentionally EMPTY: the public plugin carries no
+ * provider-specific entries. Personal measured windows belong in the
+ * user-directory file `~/.dsh/dsh-autocompact/seeds.json` (outside git),
+ * merged between these defaults and runtime-learned state.json entries.
+ */
+const SEED_WINDOWS: Record<string, WindowEntry> = {};
 
 const PLUGIN_DIR_NAME = 'dsh-autocompact';
 
@@ -120,10 +119,34 @@ function statePath(): string {
   return path.join(dshHome(), PLUGIN_DIR_NAME, 'state.json');
 }
 
+function userSeedsPath(): string {
+  return path.join(dshHome(), PLUGIN_DIR_NAME, 'seeds.json');
+}
+
+/** Personal seed table kept outside the repository; tolerant reader. */
+function loadUserSeeds(): Record<string, WindowEntry> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(userSeedsPath(), 'utf8')) as Record<string, Partial<WindowEntry>>;
+    const out: Record<string, WindowEntry> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value?.contextWindow === 'number' && Number.isFinite(value.contextWindow)) {
+        out[key] = {
+          contextWindow: Math.floor(value.contextWindow),
+          source: typeof value.source === 'string' && value.source.length > 0 ? value.source : 'user seeds.json',
+          updatedAt: 0,
+        };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 function loadState(): AutocompactState {
   const base: AutocompactState = {
     version: 1,
-    windows: { ...SEED_WINDOWS },
+    windows: { ...SEED_WINDOWS, ...loadUserSeeds() },
     classified: 0,
     learned: 0,
     injected: [],
@@ -133,7 +156,7 @@ function loadState(): AutocompactState {
     const parsed = JSON.parse(raw) as Partial<AutocompactState>;
     return {
       version: 1,
-      windows: { ...SEED_WINDOWS, ...(parsed.windows ?? {}) },
+      windows: { ...SEED_WINDOWS, ...loadUserSeeds(), ...(parsed.windows ?? {}) },
       classified: parsed.classified ?? 0,
       learned: parsed.learned ?? 0,
       injected: parsed.injected ?? [],
@@ -414,6 +437,7 @@ export function apply(ctx: Context): void {
     lines.push('');
     lines.push(`Official compaction packages resolvable from profile dir: ${probe.ok ? 'yes' : 'not from profile dir (usually fine — DSH resolves preset plugin rows from the app bundle; restore the .bak only if an injected preset fails to boot)'}`);
     lines.push(`State file: ${statePath()}`);
+    lines.push(`User seeds file: ${userSeedsPath()} (personal entries, not in git)`);
     return lines.join('\n');
   };
 
