@@ -180,7 +180,7 @@ function saveState(state: AutocompactState): void {
 
 // ── preset injection ─────────────────────────────────────────────────────────
 
-/** The official compaction group block (mirrors novel-solo/liangshen presets). */
+/** The official compaction group block (mirrors compaction-enabled presets). */
 function compactionBlock(groupId: string): string {
   return [
     '',
