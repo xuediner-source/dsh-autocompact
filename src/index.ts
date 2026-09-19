@@ -43,47 +43,13 @@ import {
   LlmError,
   isContextWindowExceededError,
 } from '@deepseek-ai/dsh-llm';
+import { overflowLikely, captureWindow } from './overflow.js';
+
+export { overflowLikely, captureWindow } from './overflow.js';
 
 export const name = 'dsh-autocompact';
 /** Only llm is mandatory; settings/commands are resolved defensively. */
 export const inject = ['llm'];
-
-// ── overflow detection ───────────────────────────────────────────────────────
-
-/** Message patterns emitted by upstreams when the prompt exceeds the window. */
-const OVERFLOW_RES: RegExp[] = [
-  /prompt is too long/i,
-  /context_length_exceeded/i,
-  /maximum context/i,
-  /context window/i,
-  /exceeds the model context/i,
-  /model context limit/i,
-  /超出模型长度上限/,
-  /request_body_too_large/i,
-  /request.{0,24}too.{0,12}large/i,
-  /\b11115\b/,
-];
-
-/** Extract the upstream's stated token limit, when the message carries one. */
-const WINDOW_CAPTURE_RES: RegExp[] = [
-  /tokens?\s*>\s*([\d,]+)\s*maximum/i,
-  /maximum context length is\s*([\d,]+)/i,
-  /context[_\s-]?length\D{0,24}([\d,]{4,})/i,
-];
-
-function overflowLikely(message: string): boolean {
-  return OVERFLOW_RES.some((re) => re.test(message));
-}
-
-function captureWindow(message: string): number | undefined {
-  for (const re of WINDOW_CAPTURE_RES) {
-    const m = re.exec(message);
-    if (m === null) continue;
-    const n = Number(m[1].replace(/,/g, ''));
-    if (Number.isFinite(n) && n >= 1000 && n <= 10_000_000) return Math.floor(n);
-  }
-  return undefined;
-}
 
 // ── persisted state (true-window table) ─────────────────────────────────────
 
@@ -239,12 +205,12 @@ function resolutionProbe(): { ok: boolean; anchors: string[] } {
 
 interface InjectionResult {
   preset: string;
-  action: 'injected' | 'already-mounted' | 'failed';
+  action: 'injected' | 'already-mounted' | 'failed' | 'pending';
   backup?: string;
   note?: string;
 }
 
-function injectPresets(state: AutocompactState): InjectionResult[] {
+export function injectPresets(state: AutocompactState, { write = false }: { write?: boolean } = {}): InjectionResult[] {
   const results: InjectionResult[] = [];
   const presetsDir = path.join(dshHome(), '.agent-presets');
   let entries: string[] = [];
@@ -264,15 +230,23 @@ function injectPresets(state: AutocompactState): InjectionResult[] {
     } catch {
       continue;
     }
-    if (/^\s*- id: compaction-basic\s*$/m.test(content)) {
+    if (/^\s*- id: compaction-basic\s*$/m.test(content) || /name:\s*['"]?@deepseek-ai\/dsh-compaction-basic['"]?/.test(content)) {
       results.push({ preset: presetName, action: 'already-mounted' });
       continue;
     }
     const groupId = /^\s*- id: compaction\s*$/m.test(content)
       ? 'compaction-autocompact'
       : 'compaction';
+    const backup = `${file}.bak-autocompact`;
+    if (!write) {
+      results.push({
+        preset: presetName,
+        action: 'pending',
+        note: 'dry-run: run /autocompact inject to write this preset (backup will be .bak-autocompact)',
+      });
+      continue;
+    }
     try {
-      const backup = `${file}.bak-autocompact`;
       fs.copyFileSync(file, backup);
       fs.writeFileSync(file, content.replace(/\s*$/, '\n') + compactionBlock(groupId), 'utf8');
       results.push({
@@ -353,8 +327,10 @@ export function apply(ctx: Context): void {
     }
   };
 
+  const originalStream = llm !== undefined && typeof llm.stream === 'function' ? llm.stream.bind(llm) : null;
+  const originalResolve = llm !== undefined && typeof llm.resolveModelInfo === 'function' ? llm.resolveModelInfo.bind(llm) : null;
+
   if (llm !== undefined && typeof llm.stream === 'function' && llm.__autocompactStream !== true) {
-    const originalStream = llm.stream.bind(llm);
     llm.stream = async function* patchedStream(
       options: { provider?: string; model?: string } | undefined,
       ...rest: unknown[]
@@ -362,7 +338,7 @@ export function apply(ctx: Context): void {
       const provider = options?.provider;
       const model = options?.model;
       try {
-        for await (const chunk of originalStream(options, ...rest) as AsyncIterable<LlmStreamChunkLike>) {
+        for await (const chunk of originalStream!(options, ...rest) as AsyncIterable<LlmStreamChunkLike>) {
           if (chunk !== null && typeof chunk === 'object' && chunk.kind === 'error' && chunk.failure !== undefined) {
             yield { ...chunk, failure: classify(provider, model, chunk.failure) as typeof chunk.failure };
           } else {
@@ -378,13 +354,12 @@ export function apply(ctx: Context): void {
   }
 
   if (llm !== undefined && typeof llm.resolveModelInfo === 'function' && llm.__autocompactResolve !== true) {
-    const originalResolve = llm.resolveModelInfo.bind(llm);
     llm.resolveModelInfo = async function patchedResolve(
       provider: string,
       model: string,
       ...rest: unknown[]
     ): Promise<{ context?: { contextWindow?: number } } | undefined> {
-      const info = await originalResolve(provider, model, ...rest) as { context?: { contextWindow?: number } } | undefined;
+      const info = await originalResolve!(provider, model, ...rest) as { context?: { contextWindow?: number } } | undefined;
       try {
         const entry = state.windows[`${provider}/${model}`];
         const declared = info?.context?.contextWindow;
@@ -404,10 +379,13 @@ export function apply(ctx: Context): void {
   }
 
   // ── preset mounting ────────────────────────────────────────────────────────
-  const injections = injectPresets(state);
+  // Boot is dry-run: never rewrite ~/.dsh/.agent-presets unless the user
+  // explicitly runs `/autocompact inject`.
+  let injections = injectPresets(state, { write: false });
   state.injected = injections.filter((r) => r.action === 'injected').map((r) => r.preset);
   saveState(state);
   for (const r of injections) {
+    if (r.action === 'pending') log(`preset "${r.preset}": compaction group missing — run /autocompact inject to write (dry-run)`);
     if (r.action === 'injected') log(`preset "${r.preset}": compaction group injected (backup: ${r.backup ?? 'n/a'})${r.note !== undefined ? ` — ${r.note}` : ''}`);
     if (r.action === 'failed') log(`preset "${r.preset}": injection FAILED — ${r.note ?? 'unknown'}`);
   }
@@ -442,18 +420,42 @@ export function apply(ctx: Context): void {
   };
 
   const commands = ctx.get('commands') as
-    | { register?: (cmd: { name: string; description: string; handler: () => Promise<{ kind: string; text: string }> }) => unknown }
+    | { register?: (cmd: { name: string; description: string; input?: { hint?: string }; handler: (inv?: { rawInput?: string }) => Promise<{ kind: string; text: string }> }) => unknown }
     | undefined;
   if (commands !== undefined && typeof commands.register === 'function') {
     try {
       commands.register({
         name: 'autocompact',
-        description: '上下文自动压缩守护：真实窗口表 / 溢出分类计数 / preset 压缩组注入状态',
-        handler: async () => ({ kind: 'success', text: statusText() }),
+        description: '上下文自动压缩守护：status（默认）或 inject（显式写入 preset）',
+        input: { hint: '[status | inject]' },
+        handler: async (inv) => {
+          const sub = String(inv?.rawInput ?? '').trim().split(/\s+/)[0]?.toLowerCase() || 'status';
+          if (sub === 'inject') {
+            injections = injectPresets(state, { write: true });
+            state.injected = injections.filter((r) => r.action === 'injected').map((r) => r.preset);
+            saveState(state);
+            return { kind: 'success', text: statusText() };
+          }
+          return { kind: 'success', text: statusText() };
+        },
       });
     } catch (error) {
       ctx.logger.warn(`[autocompact] /autocompact command registration failed: ${String(error)}`);
     }
+  }
+
+  const dispose = (): void => {
+    if (llm !== undefined) {
+      if (originalStream) llm.stream = originalStream;
+      if (originalResolve) llm.resolveModelInfo = originalResolve;
+      delete llm.__autocompactStream;
+      delete llm.__autocompactResolve;
+    }
+  };
+  try {
+    (ctx as { effect?: (fn: () => () => void, label?: string) => void }).effect?.(() => dispose, 'dsh-autocompact: llm seam');
+  } catch {
+    // host without ctx.effect — patch stays until process exit
   }
 
   log(`boot complete — windows=${Object.keys(state.windows).length}, streamPatched=${llm?.__autocompactStream === true}, resolvePatched=${llm?.__autocompactResolve === true}`);

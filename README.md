@@ -24,10 +24,10 @@ DeepSeek Harness 通用上下文自动压缩守护插件：对**所有模型、�
    仓库代码不含任何 provider 预置条目：个人实测值写入用户目录
    `~/.dsh/dsh-autocompact/seeds.json`（不在 git 内），运行时学到的值
    持久化在同目录 `state.json`。
-3. **压缩组挂载**：扫描 `~/.dsh/.agent-presets/*/agent.cordis.yml`，给缺少
-   官方压缩组的预设自动追加
-   `compaction-basic + command-compact + tool-result-pruner`（与官方
-   启用压缩的预设相同的配置块），注入前生成 `.bak-autocompact` 备份。
+3. **压缩组挂载（显式）**：扫描 `~/.dsh/.agent-presets/*/agent.cordis.yml`。
+   **启动只做 dry-run**，不会改用户 yaml。执行 `/autocompact inject` 才会给缺少
+   官方压缩组的预设追加 `compaction-basic + command-compact + tool-result-pruner`，
+   注入前生成 `.bak-autocompact` 备份。`@deepseek-ai/dsh-llm` 是 peer，不要装进插件目录。
 
 ## 安装
 
@@ -47,7 +47,8 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-autocompact
 
 ## 验证
 
-会话中执行 `/autocompact status`：查看真实窗口表、分类计数、注入结果。
+会话中执行 `/autocompact` 或 `/autocompact status`：查看真实窗口表、分类计数、待注入预设。
+确认后执行 `/autocompact inject` 才会写盘。`npm test` 覆盖溢出分类。
 
 ## 卸载
 
